@@ -7,7 +7,9 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"time"
 
+	"github.com/wheelcomplex/preinit/cmtp"
 	"github.com/wheelcomplex/preinit/misc"
 )
 
@@ -21,65 +23,31 @@ type Config struct {
 	//
 	Key string
 
-	// dispatcher listeners
+	// timeout in time.Microsecond for protocol identify
+	// default is PROTOCOL_DEFAULT_TIMEOUT
+	IdentTimeout int
+
+	// tcp listeners
 	// listen on host:port for client connection
 	// empty list to disable client listening
 	// default: map[string]string{"0.0.0.0:6099":"0.0.0.0:6099"}
-	DispListens map[string]string
-
-	// dispatcher filter use to handle data assemble/disassemble
-	// default: NewTCPDispFilter("--CMTP--", "0.0.0.0:6099")
-	DFilters *DispChain
-
-	// transport listeners
-	// listen on host:port for transport connection
-	// peer listening only accept the remote with same token/key
-	// empty list to disable peer listening
-	// TranListens and TranPeerList should not empty at the same time
-	// default: map[string]string{"0.0.0.0:9099":"0.0.0.0:9099"}
-	TranListens map[string]string
-
-	// remote forwarder list, format: host:port, index by name
-	// on startup, connect to remote with token
-	// TranListens and TranPeerList should not empty at the same time
-	// default: {} (empty)
-	TranPeerList map[string]string
-
-	// number of connections create to each trnasport peer
-	// default is 5
-	TranNum int
-
-	// transport filter use to handle data frame encode/decode
-	// default: NewTCPDispFilter("--CMTP--", "0.0.0.0:6099")
-	TFilter TranFilter
-
-	// auth token for remote identify
-	// is hash of Key
-	token uint64
+	TCPListens map[string]string
 }
 
 //
 func NewConfig(key string) *Config {
 	return &Config{
 		Key:          key,
-		DispListens:  make(map[string]string),
-		DFilters:     NewDispChain(),
-		TranListens:  make(map[string]string),
-		TranPeerList: make(map[string]string),
-		TranNum:      5,
-		TFilter:      nil,
+		IdentTimeout: PROTOCOL_DEFAULT_TIMEOUT,
+		TCPListens:   make(map[string]string),
 	}
 }
 
 // passiveConfig is default config for MixerServer
 var passiveConfig = Config{
 	Key:          "",
-	DispListens:  map[string]string{"0.0.0.0:6099": "0.0.0.0:6099"},
-	TranListens:  map[string]string{"0.0.0.0:9099": "0.0.0.0:9099"},
-	TranPeerList: map[string]string{},
-	DFilters:     NewDispChain(),
-	TFilter:      nil,
-	TranNum:      5,
+	TCPListens:   map[string]string{"0.0.0.0:6099": "0.0.0.0:6099"},
+	IdentTimeout: PROTOCOL_DEFAULT_TIMEOUT,
 }
 
 // Merge feed cfg with value from template
@@ -91,58 +59,41 @@ func (cfg *Config) Merge(template *Config) {
 	if len(cfg.Key) == 0 {
 		cfg.Key = template.Key
 	}
-	if len(cfg.DispListens) == 0 && len(template.DispListens) > 0 {
-		for idx, _ := range template.DispListens {
-			cfg.DispListens[idx] = template.DispListens[idx]
+	if cfg.IdentTimeout <= 0 {
+		cfg.IdentTimeout = template.IdentTimeout
+	}
+	if len(cfg.TCPListens) == 0 && len(template.TCPListens) > 0 {
+		for idx, _ := range template.TCPListens {
+			cfg.TCPListens[idx] = template.TCPListens[idx]
 		}
 	}
-	if len(cfg.TranListens) == 0 && len(template.TranListens) > 0 {
-		for idx, _ := range template.TranListens {
-			cfg.TranListens[idx] = template.TranListens[idx]
-		}
-	}
-	if len(cfg.TranPeerList) == 0 && len(template.TranPeerList) > 0 {
-		for idx, _ := range template.TranPeerList {
-			cfg.TranPeerList[idx] = template.TranPeerList[idx]
-		}
-	}
-	if cfg.DFilters.Len() == 0 && template.DFilters.Len() > 0 {
-		cfg.DFilters = template.DFilters.Clone()
-	}
-	if cfg.TFilter == nil {
-		cfg.TFilter = template.TFilter
-	}
-	if cfg.TranNum <= 0 {
-		cfg.TranNum = template.TranNum
-	}
+
 }
 
 //
 type MixerServer struct {
-	cfg           *Config                         // config data for server
-	tranConns     map[string]map[int]*net.TCPConn //
-	tranListeners map[string]*net.TCPListener     //
-	dispConns     map[string]map[int]*net.TCPConn //
-	dispListeners map[string]*net.TCPListener     //
-	closing       chan struct{}                   //
-	closed        chan struct{}                   //
-	m             sync.Mutex                      //
-	err           error                           //
-	waitCh        chan error                      //
-	destroyed     chan struct{}                   //
-	wg            sync.WaitGroup                  //
-	running       bool                            //
-	dispPool      *sync.Pool                      //
+	cfg           *Config                     // config data for server
+	token         uint64                      // auth token for remote identify, is hash of Key
+	dispListeners map[string]*net.TCPListener //
+	closing       chan struct{}               //
+	closed        chan struct{}               //
+	m             sync.Mutex                  //
+	err           error                       //
+	waitCh        chan error                  //
+	destroyed     chan struct{}               //
+	wg            sync.WaitGroup              //
+	running       bool                        //
 }
 
 // NewServer initial MixerServer using cfg config
 func NewServer(cfg *Config) (*MixerServer, error) {
 	// default setup
+	if cfg == nil {
+		cfg = NewConfig("")
+	}
 	cfg.Merge(&passiveConfig)
 	ms := &MixerServer{
 		cfg:           cfg,
-		tranConns:     make(map[string]map[int]*net.TCPConn),
-		tranListeners: make(map[string]*net.TCPListener),
 		dispConns:     make(map[string]map[int]*net.TCPConn),
 		dispListeners: make(map[string]*net.TCPListener),
 		closing:       make(chan struct{}, 128),
@@ -150,64 +101,50 @@ func NewServer(cfg *Config) (*MixerServer, error) {
 		destroyed:     make(chan struct{}, 128),
 		waitCh:        make(chan error, 128),
 	}
-	if err := ms.ConfigCheck(ms.cfg); err != nil {
-		return nil, err
-	}
 	//
 	return ms, nil
 }
 
-// NewActiveServer return MixerServer using active config
-// mixer will connect to another mixer
-func NewActiveServer(key string, peerList map[string]string) (*MixerServer, error) {
+// NewListenServer return MixerServer with listener list
+func NewListenServer(key string, listens map[string]string) (*MixerServer, error) {
 	cfg := NewConfig(key)
-	cfg.Merge(&passiveConfig)
-	// disable client listener
-	cfg.TranListens = map[string]string{}
-	// disable peer listener
-	cfg.TranListens = map[string]string{}
-	//
-	cfg.TranPeerList = peerList
+	cfg.TCPListens = listens
 	return NewServer(cfg)
 }
 
-// NewPassiveServer return MixerServer using passive config
-// mixer will waitting connect from another mixer
-func NewPassiveServer(key string) (*MixerServer, error) {
-	cfg := NewConfig(key)
-	return NewServer(cfg)
-}
-
-// NewFullServer return MixerServer using passive config + peerList
-// mixer will connect to another mixer, and wait for connect from another mixer/local client
-func NewFullServer(key string, peerList map[string]string) (*MixerServer, error) {
-	cfg := NewConfig(key)
-	cfg.Merge(&passiveConfig)
-	//
-	cfg.TranPeerList = peerList
-	return NewServer(cfg)
-}
-
-// ConfigCheck check config and return error
-func (ms *MixerServer) ConfigCheck(cfg *Config) error {
-	if cfg == nil {
-		return errors.New("invalid config: nil config")
-	}
-	if len(cfg.TranPeerList) == 0 && len(cfg.TranListens) == 0 {
-		return errors.New("invalid config: both TranPeerList and TranListens empty")
-	}
-	return nil
-}
-
-// AddDispFilter add DispFilter(dispacher) to server
+// AddProtoFilter add ProtoFilter(dispacher) to server
 // must call befor server start
-func (ms *MixerServer) AddDispFilter(name string, tf DispFilter) error {
+func (ms *MixerServer) AddProtoFilter(name string, tf ProtoFilter) error {
 	ms.m.Lock()
 	defer ms.m.Unlock()
 	if ms.running {
 		return errors.New("can't add filter when server running")
 	}
-	ms.cfg.DFilters.AddDispFilter(name, tf)
+	ms.cfg.DFilters.AddProtoFilter(name, tf)
+	return nil
+}
+
+// RegisterFilter register protocol filter to server
+// must call befor server start
+func (ms *MixerServer) RegisterFilter(pf ProtoFilter) error {
+	ms.m.Lock()
+	defer ms.m.Unlock()
+	if ms.running {
+		return errors.New("can't add filter when server running")
+	}
+	ms.cfg.DFilters.AddProtoFilter(name, tf)
+	return nil
+}
+
+// RegisterTransfer register transfer to server
+// must call befor server start
+func (ms *MixerServer) RegisterTransfer(tf Transfer) error {
+	ms.m.Lock()
+	defer ms.m.Unlock()
+	if ms.running {
+		return errors.New("can't add filter when server running")
+	}
+	ms.cfg.DFilters.AddProtoFilter(name, tf)
 	return nil
 }
 
@@ -234,12 +171,12 @@ func (ms *MixerServer) Wait() <-chan error {
 	return ms.waitCh
 }
 
-// newDispSession used for sync.pool to create session struct
-func (ms *MixerServer) newDispSession() func() interface{} {
-	return func() interface{} {
-		return ms.cfg.DFilters.Clone()
-	}
-}
+//// newDispSession used for sync.pool to create session struct
+//func (ms *MixerServer) newDispSession() func() interface{} {
+//	return func() interface{} {
+//		return ms.cfg.DFilters.Clone()
+//	}
+//}
 
 //
 func (ms *MixerServer) dispAcceptClient(idx string, wg *sync.WaitGroup) {
@@ -250,6 +187,9 @@ func (ms *MixerServer) dispAcceptClient(idx string, wg *sync.WaitGroup) {
 	// ms.dispListeners[idx]
 	// ms.cfg.TFilter
 	tpf("dispAcceptClient from  %s ...\n", idx)
+	var tempDelay time.Duration // how long to sleep on accept failure
+	var errcount int
+	max := 1 * time.Second
 	for {
 		select {
 		case <-ms.closing:
@@ -259,21 +199,40 @@ func (ms *MixerServer) dispAcceptClient(idx string, wg *sync.WaitGroup) {
 		// TODO: close listener when closing
 		newrw, newerr := ms.dispListeners[idx].AcceptTCP()
 		if newerr != nil {
+			if ne, ok := newerr.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if tempDelay > max {
+					tempDelay = max
+				}
+				tpf("http: Accept error: %v; retrying in %v", newerr, tempDelay)
+				time.Sleep(tempDelay)
+				errcount++
+				if errcount > cmtp.CMTP_MAX_EMPTY_IO {
+					tpf("dispAcceptClient %d exit for error: %v\n", idx, newerr)
+				} else {
+					continue
+				}
+			}
 			tpf("dispAcceptClient %d exit for error: %v\n", idx, newerr)
 			return
 		}
 		//
 		//tpf("dispAcceptClient %s, AcceptTCP: %v: %v\n", idx, newrw, newerr)
+		tempDelay = 0
 		//
-		dispchain := ms.dispPool.Get().(*DispChain)
+		dispchain := ms.cfg.DFilters.Clone()
 		if dispchain.Len() == 0 {
-			dispchain.AddDispFilter("noopfilter", NewNoopTCPFilter(newrw))
+			dispchain.AddProtoFilter("noopfilter", NewNoopTCPFilter(newrw))
 		} else {
 			dispchain.Reset()
 			dispchain.BindUpStream(NewNoopTCPFilter(newrw))
 		}
 		//tpf("dispAcceptClient %s, AcceptTCP: %v: %v\n", idx, newrw, newerr)
-		ms.cfg.TFilter.AddUpFilter(dispchain)
+		ms.cfg.TFilter.AddFilter(dispchain)
 	}
 }
 
@@ -283,7 +242,7 @@ func (ms *MixerServer) dispListener() {
 
 	var wg sync.WaitGroup
 
-	for idx, _ := range ms.cfg.DispListens {
+	for idx, _ := range ms.cfg.TCPListens {
 		tpf("Accepting %s for client ...\n", idx)
 		wg.Add(1)
 		go ms.dispAcceptClient(idx, &wg)
@@ -352,7 +311,7 @@ func (ms *MixerServer) Start() error {
 	//
 	tpf("TFilter: %v\n", ms.cfg.TFilter)
 	if ms.cfg.TFilter == nil {
-		ms.cfg.TFilter = NewHttpEchoTranFilter()
+		ms.cfg.TFilter = NewHttpEchoTransfer()
 	}
 	tpf("TFilter: %v\n", ms.cfg.TFilter)
 
@@ -363,25 +322,13 @@ func (ms *MixerServer) Start() error {
 		in, out, err := ms.cfg.TFilter.Forward()
 		tpf("TFilter.Forward exit: %d, %d, %v\n", in, out, err)
 	}()
-	ms.wg.Add(1)
-	go func() {
-		defer ms.wg.Done()
-		for item := range ms.cfg.TFilter.RealsedDispChain() {
-			ms.dispPool.Put(item)
-		}
-	}()
-
-	//
-	ms.dispPool = &sync.Pool{
-		New: ms.newDispSession(),
-	}
 
 	//
 	go ms.closer()
 	//
 	// initial client listener
 	//
-	for idx, laddr := range ms.cfg.DispListens {
+	for idx, laddr := range ms.cfg.TCPListens {
 		nl, err := net.Listen("tcp", laddr)
 		tpf("listening %s for client ... %v\n", idx, err)
 		if err != nil {

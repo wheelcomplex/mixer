@@ -47,10 +47,10 @@ func main() {
 		*runlimit = 1
 	}
 
-	var peerList map[string]string = map[string]string{"localnginx": "127.0.0.1:80"}
-	ms, err := mixer.NewFullServer("abccd", peerList)
+	//	var peerList map[string]string = map[string]string{"localnginx": "127.0.0.1:80"}
+	ms, err := mixer.NewServer(nil)
 	if err != nil {
-		misc.Tpf("NewFullServer: %s\n", err)
+		misc.Tpf("NewServer: %s\n", err)
 		return
 	}
 	if err := ms.Start(); err != nil {

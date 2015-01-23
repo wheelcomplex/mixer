@@ -1,4 +1,4 @@
-// TranFilter act as http echo server for mixer
+// http echo server for mixer
 
 package mixer
 
@@ -6,70 +6,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/wheelcomplex/preinit/cmtp"
 	"github.com/wheelcomplex/preinit/queues"
 )
-
-// HttpEchoTranFilter has multi-io support
-type HttpEchoTranFilter struct {
-	newrawio   chan *DispChain
-	idlerawio  chan *DispChain
-	lastIdx    int
-	rawio      []*DispChain
-	idleslot   *queues.LifoQ
-	workerMsg  chan *cmtp.CMsg
-	tranio     io.ReadWriteCloser
-	closing    chan struct{}
-	closed     chan struct{}
-	m          sync.Mutex
-	forwarding bool
-	waitCh     chan error
-}
-
-//
-func NewHttpEchoTranFilter() *HttpEchoTranFilter {
-	return &HttpEchoTranFilter{
-		newrawio:  make(chan *DispChain, cmtp.CHANNEL_BUFFER_SIZE),
-		idlerawio: make(chan *DispChain, cmtp.CHANNEL_BUFFER_SIZE),
-		lastIdx:   -1,
-		rawio:     make([]*DispChain, 0, cmtp.CHANNEL_BUFFER_SIZE),
-		idleslot:  queues.NewLifoQ(cmtp.CHANNEL_BUFFER_SIZE * 64),
-		workerMsg: make(chan *cmtp.CMsg, cmtp.CHANNEL_BUFFER_SIZE),
-		waitCh:    make(chan error, 128),
-	}
-}
-
-//
-func (xf *HttpEchoTranFilter) New() TranFilter {
-	return NewHttpEchoTranFilter()
-}
-
-//
-func (xf *HttpEchoTranFilter) RealsedDispChain() <-chan *DispChain {
-	return xf.idlerawio
-}
-
-// AddTranStream add io.ReadWriteCloser to TranFilter
-// NOTE: HttpEchoTranFilter do nothing to TranStream
-func (xf *HttpEchoTranFilter) AddTranStream(rw io.ReadWriteCloser) error {
-	if xf.tranio != nil {
-		xf.tranio.Close()
-	}
-	xf.tranio = rw
-	return nil
-}
-
-//
-func (xf *HttpEchoTranFilter) AddUpFilter(rw *DispChain) error {
-	//tpf("HttpEchoTranFilter, AddUpFilter: %v\n", rw)
-	xf.newrawio <- rw
-	//tpf("HttpEchoTranFilter, AddUpFilter: %v\n", rw)
-	return nil
-}
 
 // http state
 const (
@@ -172,8 +115,48 @@ func httpURIParser(buf []byte) (int, error) {
 	}
 }
 
+// HttpEchoTransfer has multi-io support
+type HttpEchoTransfer struct {
+	newrawio   chan *net.TCPConn
+	lastIdx    int
+	rawio      []*net.TCPConn
+	idleslot   *queues.LifoQ
+	workerMsg  chan *cmtp.CMsg
+	closing    chan struct{}
+	closed     chan struct{}
+	m          sync.Mutex
+	forwarding bool
+	waitCh     chan error
+}
+
 //
-func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
+func NewHttpEchoTransfer() *HttpEchoTransfer {
+	return &HttpEchoTransfer{
+		newrawio:  make(chan *net.TCPConn, cmtp.CHANNEL_BUFFER_SIZE),
+		lastIdx:   -1,
+		rawio:     make([]*net.TCPConn, 0, cmtp.CHANNEL_BUFFER_SIZE),
+		idleslot:  queues.NewLifoQ(cmtp.CHANNEL_BUFFER_SIZE * 64),
+		workerMsg: make(chan *cmtp.CMsg, cmtp.CHANNEL_BUFFER_SIZE),
+		waitCh:    make(chan error, cmtp.CHANNEL_INIT_SIZE),
+		closing:   make(chan struct{}, cmtp.CHANNEL_INIT_SIZE),
+		closed:    make(chan struct{}, cmtp.CHANNEL_INIT_SIZE),
+	}
+}
+
+// HandleConn add *net.TCPConn to Transfer
+// NOTE: HttpEchoTransfer do nothing to TranStream
+func (xf *HttpEchoTransfer) HandleConn(rw *net.TCPConn) error {
+	select {
+	case <-xf.closing:
+		return errors.New("HttpEchoTransfer already closed")
+	default:
+		xf.newrawio <- rw
+	}
+	return nil
+}
+
+//
+func (xf *HttpEchoTransfer) echoserver(rwidx int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	state := HTTP_STATE_KEEPALIVE
@@ -184,7 +167,7 @@ func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
 	outmsg := &cmtp.CMsg{
 		Id: uint64(rwidx),
 	}
-	var rw *DispChain
+	var rw *net.TCPConn
 	// TODO: use slab pool/sync pool
 	buf := make([]byte, HTTP_MAX_HEADER_SIZE) // 4k
 	iotimeout := time.Second * 5
@@ -212,21 +195,12 @@ func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
 				state = HTTP_STATE_READREQHEADER
 				iostarts = time.Now()
 				timelimit = iostarts.Add(iotimeout)
+				rw.SetDeadline(timelimit)
 				buf = buf[:cap(buf)]
 				totalreadbytes = 0
 				emptyio = 0
 				fallthrough
 			case HTTP_STATE_READREQHEADER:
-				nowts = time.Now()
-				if nowts.After(timelimit) {
-					inmsg.Err = fmt.Errorf("conn#%d, HTTP_STATE_READREQHEADER timeout %v", rwidx, iotimeout)
-					tpf("%s ...\n", inmsg.Err.Error())
-					xf.workerMsg <- inmsg
-					//xf.workerMsg <- outmsg
-					return
-				} else {
-					rw.SetDeadline(timelimit)
-				}
 				//for item := range rw.Range() {
 				//	tpf("reading from %s %v, limit %v\n", item.Name, item.Filter, timelimit)
 				//}
@@ -303,6 +277,7 @@ func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
 			case HTTP_STATE_PARSEREQBODY:
 				iostarts = time.Now()
 				timelimit = iostarts.Add(iotimeout)
+				rw.SetDeadline(timelimit)
 				totalwritebytes = 0
 				emptyio = 0
 				// send http200ok response
@@ -312,16 +287,6 @@ func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
 			case HTTP_STATE_SENDHEADER:
 				fallthrough
 			case HTTP_STATE_SENDBODY:
-				nowts = time.Now()
-				if nowts.After(timelimit) {
-					outmsg.Err = fmt.Errorf("conn#%d, HTTP_STATE_SENDBODY timeout %v", rwidx, iotimeout)
-					tpf("%s ...\n", outmsg.Err.Error())
-					//xf.workerMsg <- inmsg
-					xf.workerMsg <- outmsg
-					return
-				} else {
-					rw.SetDeadline(timelimit)
-				}
 				writebytes, writeerr := rw.Write(http200ok[totalwritebytes:])
 				if writebytes > 0 {
 					outmsg.Code += uint64(writebytes)
@@ -380,16 +345,13 @@ func (xf *HttpEchoTranFilter) echoserver(rwidx int, wg *sync.WaitGroup) {
 // Forward bytes beetwen raw stream and tran stream
 // inbytes for bytes read from raw stream
 // outbytes for bytes write to raw stream
-func (xf *HttpEchoTranFilter) Forward() (inbytes uint64, outbytes uint64, err error) {
+func (xf *HttpEchoTransfer) Forward() (inbytes uint64, outbytes uint64, err error) {
 	xf.m.Lock()
 	defer xf.m.Unlock()
 	if xf.forwarding {
 		err = errors.New("already forwarding")
 		return
 	}
-	xf.closing = make(chan struct{}, 128)
-	xf.closed = make(chan struct{}, 128)
-
 	var wg sync.WaitGroup
 	/*
 		// CMsg
@@ -401,7 +363,7 @@ func (xf *HttpEchoTranFilter) Forward() (inbytes uint64, outbytes uint64, err er
 		}
 	*/
 	var msg *cmtp.CMsg
-	var rw *DispChain
+	var rw *net.TCPConn
 	/*
 		newrawio  chan io.ReadWriteCloser
 		lastIdx   int
@@ -411,7 +373,7 @@ func (xf *HttpEchoTranFilter) Forward() (inbytes uint64, outbytes uint64, err er
 	*/
 	var rwidx int
 	time.Sleep(1e9)
-	tpf("HttpEchoTranFilter forwarding ...\n")
+	tpf("HttpEchoTransfer forwarding ...\n")
 	for {
 		select {
 		case rw = <-xf.newrawio:
@@ -432,7 +394,6 @@ func (xf *HttpEchoTranFilter) Forward() (inbytes uint64, outbytes uint64, err er
 			//msg = <-xf.workerMsg
 			//tpf("echoserver exit with msg2 %s\n", msg.String())
 			xf.rawio[msg.Id].Close()
-			xf.idlerawio <- xf.rawio[msg.Id]
 			xf.rawio[msg.Id] = nil
 			xf.idleslot.Push(int(msg.Id))
 			// TODO: in/out bytes in msg.Msg
@@ -444,24 +405,20 @@ func (xf *HttpEchoTranFilter) Forward() (inbytes uint64, outbytes uint64, err er
 }
 
 //
-func (xf *HttpEchoTranFilter) Close() error {
+func (xf *HttpEchoTransfer) Close() error {
 	if xf.closing != nil {
 		close(xf.closing)
 		// waiting for forwarder closed
 		<-xf.closed
 	}
-	go func() {
-		if xf.rawio != nil {
-			for idx, _ := range xf.rawio {
-				if xf.rawio[idx] != nil {
-					xf.rawio[idx].Close()
-					xf.idlerawio <- xf.rawio[idx]
-				}
+	if xf.rawio != nil {
+		for idx, _ := range xf.rawio {
+			if xf.rawio[idx] != nil {
+				xf.rawio[idx].Close()
 			}
 		}
-		close(xf.idlerawio)
-		xf.rawio = nil
-	}()
+	}
+	xf.rawio = nil
 	if xf.tranio != nil {
 		xf.tranio.Close()
 	}
@@ -475,6 +432,6 @@ func (xf *HttpEchoTranFilter) Close() error {
 }
 
 //
-func (xf *HttpEchoTranFilter) Wait() <-chan error {
+func (xf *HttpEchoTransfer) Wait() <-chan error {
 	return xf.waitCh
 }
